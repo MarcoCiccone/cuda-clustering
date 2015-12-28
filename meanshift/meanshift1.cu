@@ -1,0 +1,628 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <iostream>
+#include <cuda.h>
+#include <cutil.h>
+#include <time.h>
+#include <device_functions.h>
+#include "cutil_inline.h"
+#include <shrQATest.h>
+#include <math.h>
+
+
+    // OpenGL Graphics includes
+#include <GL/glew.h>
+#ifdef _WIN32
+#include <GL/wglew.h>
+#endif 
+#if defined(__APPLE__) || defined(__MACOSX)
+#include <GLUT/glut.h>
+#else
+#include <GL/freeglut.h>
+#endif
+
+/*
+ 
+ TODO:
+ 
+ ripulire il codice opengl
+ spostare il ricalcolo del centroide nel kernel cuda
+ parametrizzare il numero dei kernel e il nome del file di testo.
+ ricreare uno storico per ogni centroide.
+ 
+ Spostare nelle funzioni dove � possibile.
+ cercare lo zoom da mandelbrot
+ 
+ ATTENZIONE per come � implementata adesso � inutile ricaricare i dati dei centroidi dal device
+ 
+ h_odata
+ */
+
+
+/*
+ Data on Device : 
+ valpoint d_idata
+ __constant__ centroid constData
+ [d_centroids is not use anymore] now is used constData
+ 
+ Data on Host : 
+ valpoint h_idata
+ centroid h_centroids
+ 
+ */
+
+
+/*
+ 
+ STEPS OF THE ALGORITHM: 
+ Step 1: Place randomly initial group centroids into the 2d space.
+ Step 2: Assign each object to the group that has the closest centroid.
+ Step 3: Recalculate the positions of the centroids.
+ Step 4: If the positions of the centroids didn't change go to the next step, else go to Step 2.
+ Step 5: End 
+ */
+
+
+    // Constants -----------------------------------------------------------------
+
+#define kWindowWidth	1024
+#define kWindowHeight	720
+#define MaxIterations	3
+#define Bandwidth 0.003
+#define Granularity 512
+
+#define XLucca 43.8
+#define YLucca 10.5
+
+#define XFirenze 43.7
+#define YFirenze 11.2
+
+#define offsetLongFirenze -1200.0
+#define offsetLatFirenze  -300.0
+
+#define offsetLongLucca -300.0
+#define offsetLatLucca  300.0
+
+typedef struct {
+    float x;
+    float y;
+    int index_cluster;
+    int start;
+    int end;
+}valpoint;
+
+typedef struct {
+    float x;
+    float y;
+    unsigned long numMembers;
+    float meanshift; 
+}centroid;
+
+
+static valpoint* h_idata;
+static centroid* h_centroids;
+static unsigned long numElements;
+static unsigned long numClusters;
+static double H;
+static const char* input_file;
+static const char* output_file = "output.txt";
+
+    // Function Prototypes -------------------------------------------------------
+
+GLvoid InitGL(GLvoid);
+GLvoid DrawGLScene(GLvoid);
+GLvoid glCircle3f(GLfloat x, GLfloat y, GLfloat radius); 
+
+
+    // InitGL -------------------------------------------------------------------
+
+GLvoid InitGL(GLvoid)
+{
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);		// This Will Clear The Background Color To Black
+        //Setup a 2D projection
+    glMatrixMode (GL_PROJECTION);
+    glLoadIdentity ();                          // Reset The Projection Matrix
+    glOrtho (0, kWindowWidth, kWindowHeight, 0, 0, 1);
+    glDisable(GL_DEPTH_TEST);
+        // Calculate The Aspect Ratio Of The Window
+    glMatrixMode (GL_MODELVIEW);
+    glLoadIdentity();
+    
+    
+}
+
+
+    // DrawGLScene --------------------------------------------------------------
+
+GLvoid DrawGLScene(GLvoid)
+{    
+    float XX=0,YY=0;
+    float offsetLong=0 , offsetLat = 0;   
+	if (strstr(input_file,"firenze") != NULL){
+		XX = XFirenze;
+		YY = YFirenze;
+		offsetLong = offsetLongFirenze;
+		offsetLat = offsetLatFirenze;
+	}
+	if (strstr(input_file,"lucca") != NULL){
+		XX = XLucca;
+		YY = YLucca;
+		offsetLong = offsetLongLucca;
+		offsetLat = offsetLatLucca;
+	}
+		
+        //Displacement trick for exact pixelization
+    glTranslatef(0.375, 0.375, 0);
+        //Draw a scene
+    glClear(GL_COLOR_BUFFER_BIT);
+        //glColorPointer(3, GL_FLOAT, 0, colorArray);
+    
+    int i=0,Vertex=0;
+    GLfloat x1 = 0.0 , y1 = 0.0;
+    
+    
+    offsetLong = kWindowWidth * offsetLong / 1440;
+    offsetLat = kWindowHeight * offsetLat / 900;
+    
+    GLfloat colorArray [256 * 256][3]; // color array
+    
+        // loop over all vertices 
+    srand (time(NULL)) ;
+    for (int z = 0; z < 256; z++)
+    {
+        for (int x = 0; x < 256; x++)
+        {
+                // VERTEX - vertices are numbered left to right, top to bottom
+            Vertex = (z * 256) + x;
+            
+                // COLOUR - set the values in the color array 
+                // RGB] = set same colour value to all 3 colours
+            colorArray[Vertex][0] = (rand()%255)/255.0;
+            colorArray[Vertex][1] = (rand()%255)/255.0;
+            colorArray[Vertex][2] = (rand()%255)/255.0;
+                //printf("%f    %f    %f  \n",colorArray[Vertex][0],colorArray[Vertex][1],colorArray[Vertex][2]);
+            
+            
+        }
+    }
+    
+    for (i=0; i<numElements; i++) {    
+        x1 = (h_idata[i].x-XX);
+        y1 = (h_idata[i].y-YY);
+        
+            //26000 : 1440 = fattoreLong : kWindowWidth --->   fattoreLong = kWindowWidth * 26000 / 1440
+        x1 = x1*(kWindowWidth * 26000 / 1440)+offsetLong;
+        y1 = y1*(kWindowHeight * 13000 / 900)+offsetLat;
+        
+        /*if (x1 > kWindowWidth || y1>kWindowHeight){
+         printf("Lat: %f --> px: %f \t Long: %f --> px: %f \n",h_idata[i].x,x1,h_idata[i].y,y1);
+         
+         getchar();
+         }*/
+        
+        glBegin(GL_POINTS);// Start Drawing A Point
+        glColor3f(colorArray[h_idata[i].index_cluster][0],colorArray[h_idata[i].index_cluster][1],colorArray[h_idata[i].index_cluster][2]);
+        glVertex2f(x1, y1);
+        glEnd();   
+        
+            //printf("Lat: %f --> px: %f \t Long: %f --> px: %f   index cluster : %i    \n",h_idata[i].x,x1,h_idata[i].y,y1,h_idata[i].index_cluster);
+        
+    }
+    
+        //disegno i centroidi
+    for (i=0;i<numClusters;i++){
+        x1 = (h_centroids[i].x-XX);
+        y1 = (h_centroids[i].y-YY);
+        
+        x1 = x1*(kWindowWidth * 26000 / 1440)+offsetLong;
+        y1 = y1*(kWindowHeight * 13000 / 900)+offsetLat;
+        glColor3f(colorArray[i][0],colorArray[i][1],colorArray[i][2]);
+        glCircle3f(x1,y1,5.0);
+    }
+    
+    
+        // When we've finished rendering the scene, we display it with
+    glutSwapBuffers();
+    
+}
+
+    // OpenGL keyboard function
+void keyboardFunc(unsigned char k, int, int)
+{
+    switch (k){
+        case '\033':
+        case 'q':
+        case 'Q':
+            printf("Shutting down...\n");
+            exit(EXIT_SUCCESS);
+            break;
+            
+    }
+}
+
+__device__ float Similarity(float x, float y)
+{
+    return exp(-(abs(x-y)*abs(x-y)));
+}
+
+__constant__ centroid constData[4096];
+__global__ void MeanShiftKernel( valpoint* g_idata, centroid* g_centroids, int numClusters,int numElements,int nk,float H) {
+    
+    unsigned long valindex = blockIdx.x * 256 + blockIdx.y *2 + threadIdx.x + Granularity*nk;
+	
+    if (valindex < numElements){
+        int k, iterations=0;
+        float euclideDistance;
+        float meanshift = 0xFFFFFFFF;
+        float X_sumNum = 0, Y_sumNum = 0, X_sumDenum = 0, Y_sumDenum = 0;     
+        
+        //initial point
+        valpoint M,M_new;
+        M.x = g_idata[valindex].x;
+        M.y = g_idata[valindex].y;
+        
+        // si può anche verificare che il mean shift sia minore di una certa soglia (ovvero converga a zero)
+        while (meanshift>0.0001 && iterations<MaxIterations) {
+           
+        	X_sumNum = 0;
+            Y_sumNum = 0;
+            X_sumDenum = 0;
+            Y_sumDenum = 0;
+
+            // ho gia scremato le y prendendo solo quelli a distanza max H dal punto.
+            for (k = g_idata[valindex].start; k<g_idata[valindex].end; k++){ 
+                    
+            	// adesso considero anche le x prendendo solo i punti che stanno dentro un cerchio di raggio H 
+            	euclideDistance = (float)sqrt((pow(g_idata[valindex].x - g_idata[k].x,2) + pow(g_idata[valindex].y - g_idata[k].y,2)));
+            	if (euclideDistance < H){
+					X_sumNum   += Similarity(g_idata[k].x,M.x) * g_idata[k].x;
+					X_sumDenum += Similarity(g_idata[k].x,M.x);
+					
+					Y_sumNum   += Similarity(g_idata[k].y,M.y) * g_idata[k].y;
+					Y_sumDenum += Similarity(g_idata[k].y,M.y); 
+            	}
+            }
+
+            M_new.x =  X_sumNum/X_sumDenum;
+            M_new.y =  Y_sumNum/Y_sumDenum;
+           
+            meanshift = (float)sqrt((pow(M_new.x - M.x,2) + pow(M_new.y - M.y,2)));
+            
+            M.x = M_new.x;
+            M.y = M_new.y;
+            iterations++;
+            
+        }
+       
+        g_centroids[valindex].x = M.x;
+        g_centroids[valindex].y = M.y;
+        g_centroids[valindex].numMembers = iterations;
+        g_centroids[valindex].meanshift = meanshift;
+    }
+}
+
+
+
+GLvoid glCircle3f(GLfloat x, GLfloat y, GLfloat radius) 
+{ 
+    float angle; 
+    glLineWidth(1.0f); 
+    glBegin(GL_LINE_LOOP); 
+    for(int i = 0; i < 100; i++) { 
+        angle = i*2*M_PI/100; 
+        glVertex2f(x + (cos(angle) * radius), y + (sin(angle) * radius)); 
+    } 
+    glEnd(); 
+}
+
+
+int compare(const void* p1, const void* p2)
+{
+	valpoint *ip1 = (valpoint *)p1;
+	valpoint *ip2 = (valpoint *)p2;
+	
+	if (ip1->y > ip2->y)
+		return 1;
+	else if (ip1->y < ip2->y)
+		return -1;
+	else
+		return 0;
+}
+
+
+/*INIZIO MAIN */
+int main( int argc, char** argv) 
+{
+
+	if (argc != 3){
+		printf("params : nameinputfile H");
+		return 1;
+	}
+
+	input_file = argv[1];
+	H = atof(argv[2]);
+
+	if (H < 0.001 || H > 0.008){
+		printf("Il valore di H scelto deve essere compreso fra 0.001 e 0.005. Verrà utilizzato il valore di default %d",H);
+		H = Bandwidth;
+	}
+	
+	input_file = argv[1];
+	
+	unsigned int mem_size;
+    float gridDimension = 0;
+    float euclideDistance = 0.0;
+    int i=0;
+    
+    timeval start;
+    gettimeofday(&start, NULL);
+        
+    valpoint *d_idata, *h_odata;
+    centroid *d_centroids;
+    centroid* h_ocentroids;
+    
+    CUT_DEVICE_INIT(argc, argv);
+        
+    /***************************************************/
+        // initialize the memory reading from text file
+    char *line = NULL;
+    char linefix[120];
+    FILE *inFilePtr;
+    inFilePtr = fopen(input_file, "r+");
+    
+    if (inFilePtr == NULL) {
+	   printf("Failed to open file %s",input_file);
+	   return -1;
+    }
+    
+        //calculate number of points from text file
+    while ( fgets ( linefix, sizeof linefix, inFilePtr ) != NULL ) /* read a line */{
+        numElements++;
+    }
+    mem_size = numElements * sizeof(valpoint);
+    
+        // allocate host memory
+    h_idata = (valpoint*) malloc( mem_size);
+    h_centroids = (centroid*)malloc (mem_size); // questi sono quelli inziali e che poi sostituisco via via
+    /***************************************************/
+    
+    
+    
+    /***************************************************/
+    rewind(inFilePtr); // BOF
+    for (i=0; i<numElements; i++) {
+        
+            //read latitude
+        fscanf(inFilePtr, "%f", &h_idata[i].x);
+            //read longitude
+        fscanf(inFilePtr, "%f", &h_idata[i].y);
+            //read image HTTP [NOT USED]
+        fscanf(inFilePtr, "%s", &line);
+            //printf("Lat: %f   Long %f  \n",x,y);
+        
+        h_idata[i].index_cluster = 999;
+    }
+    //ordino i punti in base alle y
+    qsort (h_idata, numElements, sizeof(valpoint), compare);
+    
+    // elimino i punti ripetuti
+    int numElementsDistinct=0;
+    for (i=1; i<numElements; i++) {
+    	
+    	if (!(h_idata[i-1].x == h_idata[i].x && h_idata[i-1].y == h_idata[i].y))
+    		numElementsDistinct++;
+    	
+    }
+    
+    mem_size = numElementsDistinct * sizeof(valpoint);
+    valpoint * distinctval = (valpoint*) malloc( mem_size);
+    
+    numElementsDistinct = 0;
+    distinctval[0] = h_idata[0];
+    for (i=1; i<numElements; i++) {
+        	
+		if (!(h_idata[i-1].x == h_idata[i].x && h_idata[i-1].y == h_idata[i].y)){
+			distinctval[numElementsDistinct] = h_idata[i];
+			numElementsDistinct++;
+		}
+		
+		
+	}
+    
+    // prendo solo una finestra di valori su cui calcolare il meanshift, ovvero quelli che hanno y distante massimo H
+    // per la x ci penso all'interno del Kernel, prendendo i punti dentro un cerchio di raggio H.
+    // mi serve per fare meno iterazioni nella procedura di calcolo del meanshift.
+    
+    int k;
+    for (i=0; i<numElementsDistinct; i++) {
+    	k=i;
+    	while(k>0){
+    		if(distinctval[i].y-distinctval[k].y >H){
+    			distinctval[i].start = k;
+    			break;
+    		}
+    		k--;
+    	}
+    	
+    	k=i;
+    	while(k<numElementsDistinct){
+    		
+    		if(distinctval[k].y-distinctval[i].y >H){
+    			distinctval[i].end = k;
+				break;
+			}
+    		k++;
+    	}
+    	if (distinctval[i].end == 0)
+    		distinctval[i].end = numElementsDistinct;
+    	//printf("%d --> %f  %f  %d  %d \n", i,distinctval[i].x, distinctval[i].y, distinctval[i].start, distinctval[i].end);
+    	//getchar();
+    }
+
+
+    h_idata = distinctval;
+    numElements = numElementsDistinct; 
+       
+    /***************************************************/
+    
+	int nKernel = ceil(numElements/Granularity)+1;
+	for(int nk=0;nk<nKernel;nk++){
+
+		//CUT_SAFE_CALL( cutStartTimer( timer));
+		
+			// allocate device memory for data points
+		CUDA_SAFE_CALL(cudaMalloc( (void**) &d_idata, mem_size));
+			// copy data points to device  [src] d_idata -> [destination] h_idata
+		CUDA_SAFE_CALL(cudaMemcpy(d_idata,h_idata, mem_size, cudaMemcpyHostToDevice) );
+		
+			// allocate device memory for data points
+		CUDA_SAFE_CALL(cudaMalloc( (void**) &d_centroids, mem_size));
+		
+			// copy centroids to device: [src symbol] h_centroids -> [destination device] constData (or d_centroids)
+		CUDA_SAFE_CALL(cudaMemcpy(d_centroids, h_centroids,mem_size,cudaMemcpyHostToDevice));
+		
+			// setup execution parameters
+		
+			//printf("%i \n",numElements);
+		
+		
+		/***************************************************/    
+		//numero elementi:  54597 (COME SUDDIVIDERLI???)
+		//(faccio eseguire un po' piu di thread? e poi dentro non faccio niente se l'id del thread è maggiore del numero di elementi
+		
+		gridDimension = (float)Granularity / 256; // per adesso la dimensione � fissata a 512 x 1 x 1 poi facciamo altre prove
+		dim3 grid(ceil(gridDimension), 2); //2048 blocks.
+		dim3 threads( 256, 1, 1); 
+		/***************************************************/
+		
+		
+			//printf("Main thread: about to dispatch kernel...\n");
+		MeanShiftKernel<<< grid, threads >>>(d_idata, d_centroids, numClusters, numElements,nk,H);
+		
+			// check if kernel execution generated and error
+		CUT_CHECK_ERROR("Kernel execution failed");
+			//allocate mem for the result on host side
+		h_odata = (valpoint*) malloc( mem_size);
+		h_ocentroids = (centroid*)malloc (mem_size);
+				
+			// copy result from device to host
+		CUDA_SAFE_CALL( cudaMemcpy( h_odata,d_idata, mem_size, cudaMemcpyDeviceToHost) );
+		CUDA_SAFE_CALL( cudaMemcpy( h_ocentroids,d_centroids, mem_size, cudaMemcpyDeviceToHost) );
+
+		 //copio dentro d_idata, d_centroids i nuovi d_odata, d_ocentroids 
+		h_idata = h_odata;
+		h_centroids = h_ocentroids;
+		
+		CUDA_SAFE_CALL(cudaFree(d_idata));
+		CUDA_SAFE_CALL(cudaFree(d_centroids));
+			
+	}
+        
+    centroid * temp_ocentroids;
+    temp_ocentroids = (centroid*)malloc (mem_size);
+    numClusters = 0;
+    bool found;
+    float euclideDistance_old = 0xFFFFFFFF;
+    int j;
+         for(i = 0; i < numElements; i++){
+            
+        	 //printf("MX %f   MY %f  ms % f  iterazioni %d  \n",h_ocentroids[i].x,h_ocentroids[i].y,h_ocentroids[i].meanshift,h_ocentroids[i].numMembers );
+             
+        	 found = false;
+        	 euclideDistance_old = 0xFFFFFFFF;
+             for(j = 0; j < numClusters; j++){
+                 //if (abs(h_ocentroids[i].x-temp_ocentroids[j].x)<0.005 && abs(h_ocentroids[i].y-temp_ocentroids[j].y)<0.005){
+            	 euclideDistance = (float)sqrt((pow(h_ocentroids[i].x - temp_ocentroids[j].x,2) + pow(h_ocentroids[i].y - temp_ocentroids[j].y,2)));    
+            	 if (euclideDistance < 0.005){
+            		 
+            		 //printf("%f   %f \n",euclideDistance,euclideDistance_old);
+            		 if (euclideDistance < euclideDistance_old){
+						 
+						 euclideDistance_old = euclideDistance;
+						 h_odata[i].index_cluster = j;
+						 found = true;
+            		 }
+                 }
+             }
+             if (!found){
+                 temp_ocentroids[j].x = h_ocentroids[i].x;
+                 temp_ocentroids[j].y = h_ocentroids[i].y;
+                 h_odata[i].index_cluster = j;
+                 numClusters++;
+             }
+             
+
+         }
+        printf("numClusters : %i \n",numClusters);
+    
+    h_idata = h_odata;
+    h_centroids = temp_ocentroids;
+
+    
+    
+    
+    timeval end;
+	gettimeofday(&end, NULL);
+	double elapsed = end.tv_sec+end.tv_usec/1000000.0 - start.tv_sec-start.tv_usec/1000000.0;
+	
+	
+	printf("Time elapsed : %f \n",elapsed);
+	
+	FILE *fp;
+	fp=fopen("output.txt", "w");
+	
+	for (i=0;i<numElements;i++){
+		fprintf(fp, "value %f   %f  Cluster %i  \n",h_idata[i].x,h_idata[i].y,h_idata[i].index_cluster);
+	 
+	}    
+	fclose(fp);
+    
+	
+	printf("Starting GLUT main loop...\n");
+    printf("\n");
+    printf("Press [q] to exit\n");
+    printf("\n");
+    
+        //inizia la parte che disegna i pixel con opengl
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
+    glutInitWindowSize(kWindowWidth, kWindowHeight); 
+    glutInitWindowPosition (100, 100);
+    glutCreateWindow (argv[0]);
+    
+    InitGL();
+    
+    glutDisplayFunc(DrawGLScene); 
+    glutKeyboardFunc(keyboardFunc);
+    
+    glutMainLoop();
+    
+    
+        //CUT_SAFE_CALL( cutStopTimer( timer));
+        //    printf( "Time: \%f(ms)\n", cutGetTimerValue( timer));
+        //    CUT_SAFE_CALL( cutDeleteTimer( timer));
+    
+    /*for (i=0;i<numElements;i++){
+     printf("value %f   %f  Cluster %i  \n",h_odata[i].x,h_odata[i].y,h_odata[i].index_cluster);
+     }*/
+        // cleanup memory
+    free( h_idata);
+    free( h_odata);
+    CUDA_SAFE_CALL(cudaFree(d_idata));
+    CUT_EXIT(argc, argv);
+    
+    /*FINE MAIN*/
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
